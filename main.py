@@ -95,6 +95,28 @@ four:
   call i32 @putchar(i32 %u4)
   ret void
 }
+
+; print_utf8_slice(ptr: i32*)
+; Prints a slice of UTF-8 characters from a pointer, until a null terminator is found.
+define void @print_utf8_slice(i32* %ptr) {
+entry:
+    %cursor = alloca i32*
+    store i32* %ptr, i32* %cursor
+    br label %loop
+loop:
+    %cur_ptr = load i32*, i32** %cursor
+    %cur_char = load i32, i32* %cur_ptr
+    %is_null = icmp eq i32 %cur_char, 0
+    br i1 %is_null, label %done, label %print
+print:
+    call void @print_utf8(i32 %cur_char)
+    ; Increment cursor
+    %next_ptr = getelementptr i32, i32* %cur_ptr, i32 1
+    store i32* %next_ptr, i32** %cursor
+    br label %loop
+done:
+    ret void
+}
 """
 
 app = Typer()
@@ -114,7 +136,9 @@ def main(input_path: Path, input_tape: str) -> None:
     module = compile(transitions, input_tape)
     my_ir = (PRELUDE + "\n" + str(module)).splitlines()
     my_ir = [
-        l for l in my_ir if 'declare void @"print_utf8"(i32 %".1")' not in l and "target" not in l
+        l for l in my_ir if ('declare void @"print_utf8"(i32 %".1")' not in l
+        and 'declare void @"print_utf8_slice"(i32* %".1")' not in l
+        and "target" not in l)
     ]
     my_ir = "\n".join(my_ir)
     output_path = input_path.with_suffix(".ll")
@@ -143,6 +167,10 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     print_utf8_ty = ir.FunctionType(void, (char,))
     print_utf8 = ir.Function(module, print_utf8_ty, name="print_utf8")
 
+    # Declare print_utf8_slice function; it's defined in PRELUDE
+    print_utf8_slice_ty = ir.FunctionType(void, (ir.PointerType(char),))
+    print_utf8_slice = ir.Function(module, print_utf8_slice_ty, name="print_utf8_slice")
+
     # Allocate tape and pointer
     tape = builder.alloca(char, size=usize(TAPE_SIZE), name="tape")
     ptr = builder.alloca(usize, name="ptr")
@@ -157,12 +185,6 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     builder.store(usize(0), print_start_idx)
     print_end_idx = builder.alloca(usize, name="print_idx.end")
     builder.store(usize(TAPE_SIZE), print_end_idx)
-
-    # Create blocks for each state
-    blocks = {"HALT": func.append_basic_block(name="state HALT")}
-    for state in transitions:
-        block = func.append_basic_block(name=f"state {state}")
-        blocks[state] = block
 
     # Zero out the tape
     zero_block = func.append_basic_block(name="zero_tape")
@@ -183,56 +205,91 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     for i, c in enumerate(input_tape, start=TAPE_SIZE // 2):
         tape_ptr = builder.gep(tape, [usize(i)], name=f"init_tape.ptr.{i}")
         builder.store(ir.Constant(char, ord(c)), tape_ptr)
-    builder.branch(blocks["INIT"])
 
-    for state in transitions:
-        builder.position_at_start(block := blocks[state])
+    unknown_block = func.append_basic_block(name="unknown_symbol")
 
-        ptr_val = builder.load(ptr, name="ptr_val")
-        tape_ptr = builder.gep(tape, [ptr_val], name="tape_ptr")
-        current_symbol = builder.load(tape_ptr, name="current_symbol")
-        transition_dict = transitions[state]
+    state_blocks = {
+        state: [func.append_basic_block(name=f"state {state}")]
+        for state in
+        sorted(transitions, key=lambda s: -1 if s== "INIT" else 0)
+    }
+    state_blocks["HALT"] = [func.append_basic_block(name="state HALT")]
 
-        # Create unknown symbol block
-        unknown_block = func.append_basic_block(name=f"state {state} unknown symbol")
-        with builder.goto_block(unknown_block):
-            builder.call(print_utf8, [ir.Constant(char, ord("["))])
-            for c in state:
-                builder.call(print_utf8, [ir.Constant(char, ord(c))])
-            builder.call(print_utf8, [ir.Constant(char, ord(":"))])
-            builder.call(print_utf8, [current_symbol])
-            builder.call(print_utf8, [ir.Constant(char, ord("]"))])
+    cake = []
 
-            builder.ret(i32(1))
+    for state, [block] in state_blocks.items():
+        if state == "HALT":
+            continue
+        with builder.goto_block(block):
+            ptr_val = builder.load(ptr, name="ptr_val")
+            tape_ptr = builder.gep(tape, [ptr_val], name="tape_ptr")
+            current_symbol = builder.load(tape_ptr, name="current_symbol")
+            transition_dict = transitions[state]
 
-        # Create switch instruction for current symbol
-        switch_inst = builder.switch(current_symbol, unknown_block)
-        for from_symbol, transition in transition_dict.items():
-            to_state = transition.to_state
-            to_symbol = transition.to_symbol
-            direction = transition.direction
-
-            to_block = func.append_basic_block(name=f"state {state} on {from_symbol}")
-            switch_inst.add_case(ir.Constant(char, ord(from_symbol)), to_block)
-
-            builder.position_at_start(to_block)
-            builder.comment(
-                f"Transition on '{from_symbol}' to state '{to_state}', write '{to_symbol}', move '{direction}'"
+            state_scalars = list(map(ord, state)) + [0]  # null-terminated
+            state_global_var = ir.GlobalVariable(
+                module, ir.ArrayType(char, len(state_scalars)), name=f"state_str_{state}"
             )
-            # Write the new symbol
-            builder.store(ir.Constant(char, ord(to_symbol)), tape_ptr)
+            state_global_var.linkage = "internal"
+            state_global_var.global_constant = True
+            state_global_var.initializer = ir.Constant(            ir
+            .ArrayType(char, len(state_scalars)),
+                [ir.Constant(char, c) for c in state_scalars],)
+            state_global_ptr = builder.gep(state_global_var, [usize(0), usize(0)], name=f"state_ptr_{state}")
+            cake.append((state_global_ptr, block))
 
-            # Move the head
-            if direction == "R":
-                new_ptr_val = builder.add(ptr_val, usize(1), name="ptr_inc")
-            else:  # direction == "L"
-                new_ptr_val = builder.sub(ptr_val, usize(1), name="ptr_dec")
-            builder.store(new_ptr_val, ptr)
+            # Create switch instruction for current symbol
+            switch_inst = builder.switch(current_symbol, unknown_block)
+            for from_symbol, transition in transition_dict.items():
+                to_state = transition.to_state
+                to_symbol = transition.to_symbol
+                direction = transition.direction
 
-            # Transition to the next state
-            builder.branch(blocks[to_state])
+                to_block = func.append_basic_block(name=f"state {state} on {from_symbol}")
+                switch_inst.add_case(ir.Constant(char, ord(from_symbol)), to_block)
 
-    builder.position_at_start(block_halt := blocks["HALT"])
+                builder.position_at_start(to_block)
+                builder.comment(
+                    f"Transition on '{from_symbol}' to state '{to_state}', write '{to_symbol}', move '{direction}'"
+                )
+                # Write the new symbol
+                builder.store(ir.Constant(char, ord(to_symbol)), tape_ptr)
+
+                # Move the head
+                if direction == "R":
+                    new_ptr_val = builder.add(ptr_val, usize(1), name="ptr_inc")
+                else:  # direction == "L"
+                    new_ptr_val = builder.sub(ptr_val, usize(1), name="ptr_dec")
+                builder.store(new_ptr_val, ptr)
+
+                # Transition to the next state
+                builder.branch(state_blocks[to_state][0])
+
+
+    with builder.goto_block(init_tape_block):
+        builder.branch(state_blocks["INIT"][0])
+
+    # Build unknown symbol block, using phi
+    builder.position_at_start(unknown_block)
+    phi_state = builder.phi(ir.PointerType(char), name="unknown_symbol_state")
+    for s, b in cake:
+        phi_state.add_incoming(s, b)
+    builder.comment("Unknown symbol encountered; printing current state and symbol.")
+    for c in map(ord, "UNKNOWN SYMBOL '"):
+        builder.call(print_utf8, [ir.Constant(char, c)])
+    ptr_val = builder.load(ptr, name="ptr_val")
+    tape_ptr = builder.gep(tape, [ptr_val], name="tape_ptr")
+    current_symbol = builder.load(tape_ptr, name="current_symbol")
+    builder.call(print_utf8, [current_symbol])
+    for c in map(ord, "' IN STATE "):
+        builder.call(print_utf8, [ir.Constant(char, c)])
+    builder.call(print_utf8_slice, [phi_state])
+    for c in map(ord, "\n"):
+        builder.call(print_utf8, [ir.Constant(char, c)])
+
+    builder.ret(i32(1))
+
+    builder.position_at_start(block_halt := state_blocks["HALT"][0])
 
     # Skip over leading _
     load_start_idx = builder.load(print_start_idx, name="load_print_start_idx")
@@ -243,7 +300,7 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     )
     builder.cbranch(
         is_underscore,
-        increment_block := func.append_basic_block(name="increment"),
+        increment_block := func.append_basic_block(name="increment_print_start_idx"),
         trim_trailing_block := func.append_basic_block(name="trim_trailing"),
     )
     builder.position_at_start(increment_block)
@@ -261,7 +318,7 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     )
     builder.cbranch(
         is_underscore_end,
-        decrement_block := func.append_basic_block(name="decrement"),
+        decrement_block := func.append_basic_block(name="decrement_print_end_idx"),
         print_loop_block := func.append_basic_block(name="print_loop"),
     )
     builder.position_at_start(decrement_block)
@@ -289,6 +346,7 @@ def compile(transitions: t.Dict[str, t.Dict[str, Transition]], input_tape: str) 
     builder.store(new_print_idx, print_start_idx)
     builder.branch(print_loop_block)
     builder.position_at_start(done_printing_block)
+
     builder.ret(i32(0))
 
     return module
